@@ -439,78 +439,139 @@ The operations (ops) team can significantly accelerate the Azure DevOps tenant m
 
 ## 8. Migration Checklist
 
+### Migration Timeline
+
+```mermaid
+gantt
+    title Azure DevOps Tenant Migration — Execution Plan
+    dateFormat  YYYY-MM-DD
+    axisFormat  %b %d
+
+    section Phase 1 — Pre-Migration
+    01 Export Org Admins                        :pre01, 2026-02-13, 1d
+    02 Export Users                             :pre02, after pre01, 1d
+    03 Export Groups                            :pre03, after pre01, 1d
+    04 Export Service Connections               :pre04, after pre01, 1d
+    05 Export Extensions                        :pre05, after pre01, 1d
+    06 Export Agent Pools                       :pre06, after pre01, 1d
+    07 Export Entra ID Inventory                :pre07, after pre02, 2d
+    08 Export RBAC Assignments                  :pre08, after pre04, 1d
+    Review & validate inventory                 :milestone, pre_review, after pre08, 0d
+
+    section Phase 2 — Preparation
+    01 Provision Users in target tenant         :prep01, 2026-02-27, 3d
+    02 Verify UPN Mapping                       :prep02, after prep01, 1d
+    03 Create Groups & memberships              :prep03, after prep02, 2d
+    04 Create App Registrations & SPs           :prep04, after prep02, 2d
+    05 Assign RBAC Roles                        :prep05, after prep04, 1d
+    06 Backup AzDO Settings                     :prep06, after prep05, 1d
+    Send final migration notification           :milestone, prep_notify, after prep06, 0d
+
+    section Phase 3 — Migration Day
+    Pre-switch checks                           :crit, mig01, 2026-03-13, 1h
+    Perform directory switch                    :crit, mig02, after mig01, 2h
+    Validate identity mappings                  :crit, mig03, after mig02, 1h
+    Verify admin sign-in                        :crit, mig04, after mig03, 1h
+
+    section Phase 4 — Post-Migration
+    01 Verify User Access                       :post01, 2026-03-14, 2d
+    02 Update Service Connections               :post02, after post01, 2d
+    03 Validate Pipelines                       :post03, after post02, 3d
+    04 Validate Artifact Feeds                  :post04, after post02, 1d
+    Users regenerate PATs & SSH keys            :post_pats, after post01, 5d
+    Test third-party integrations               :post_integ, after post03, 2d
+    User acceptance testing                     :post_uat, after post_integ, 5d
+
+    section Phase 5 — Cleanup
+    01 Cleanup Source Tenant (dry run)          :clean01, 2026-04-10, 1d
+    01 Cleanup Source Tenant (execute)          :clean02, after clean01, 1d
+    Archive migration documentation             :clean03, after clean02, 2d
+    Post-migration retrospective                :milestone, retro, after clean03, 0d
+```
+
 ### Pre-Migration (2–4 Weeks Before)
 
-- [ ] Identify and document the Azure DevOps Organization Owner and Project Collection Administrators.
-- [ ] Obtain Global Administrator access to both contoso.com and zava.com Entra ID tenants.
-- [ ] Inventory all Azure DevOps users, access levels, and licenses.
-- [ ] Inventory all Azure DevOps groups (Entra ID groups and Azure DevOps-managed groups).
-- [ ] Inventory all service connections across all projects.
-- [ ] Inventory all installed marketplace extensions.
-- [ ] Inventory all PATs and SSH keys (notify owners about invalidation).
-- [ ] Inventory all pipeline agent pools and agent registrations.
-- [ ] Document all third-party integrations (GitHub, Slack, SonarQube, etc.).
-- [ ] Document all Azure RBAC role assignments for service principals.
-- [ ] Create a communication plan and notify all stakeholders.
-- [ ] Schedule the migration window (off-hours recommended).
-- [ ] Document the rollback plan.
+| # | Status | Task | Script |
+|---|---|---|---|
+| 1 | ☐ | Identify and document the Azure DevOps Organization Owner and Project Collection Administrators. | [01-Export-OrgAdmins.ps1](scripts/pre-migration/01-Export-OrgAdmins.ps1) |
+| 2 | ☐ | Obtain Global Administrator access to both contoso.com and zava.com Entra ID tenants. | — |
+| 3 | ☐ | Inventory all Azure DevOps users, access levels, and licenses. | [02-Export-Users.ps1](scripts/pre-migration/02-Export-Users.ps1) |
+| 4 | ☐ | Inventory all Azure DevOps groups (Entra ID groups and Azure DevOps-managed groups). | [03-Export-Groups.ps1](scripts/pre-migration/03-Export-Groups.ps1) |
+| 5 | ☐ | Inventory all service connections across all projects. | [04-Export-ServiceConnections.ps1](scripts/pre-migration/04-Export-ServiceConnections.ps1) |
+| 6 | ☐ | Inventory all installed marketplace extensions. | [05-Export-Extensions.ps1](scripts/pre-migration/05-Export-Extensions.ps1) |
+| 7 | ☐ | Inventory all PATs and SSH keys (notify owners about invalidation). | — |
+| 8 | ☐ | Inventory all pipeline agent pools and agent registrations. | [06-Export-AgentPools.ps1](scripts/pre-migration/06-Export-AgentPools.ps1) |
+| 9 | ☐ | Document all third-party integrations (GitHub, Slack, SonarQube, etc.). | — |
+| 10 | ☐ | Document all Azure RBAC role assignments for service principals. | [08-Export-RBACAssignments.ps1](scripts/pre-migration/08-Export-RBACAssignments.ps1) |
+| 11 | ☐ | Export Entra ID users, groups, and app registrations from source tenant. | [07-Export-EntraIDInventory.ps1](scripts/pre-migration/07-Export-EntraIDInventory.ps1) |
+| 12 | ☐ | Create a communication plan and notify all stakeholders. | — |
+| 13 | ☐ | Schedule the migration window (off-hours recommended). | — |
+| 14 | ☐ | Document the rollback plan. | — |
 
 ### Preparation (1–2 Weeks Before)
 
-- [ ] Provision all user accounts in the zava.com Entra ID tenant.
-- [ ] Verify UPN mapping between contoso.com and zava.com users.
-- [ ] Recreate all Entra ID security groups in zava.com.
-- [ ] Recreate all Entra ID Microsoft 365 groups in zava.com (if used).
-- [ ] Populate group memberships in zava.com.
-- [ ] Create all app registrations and service principals in zava.com.
-- [ ] Generate client secrets/certificates for new service principals.
-- [ ] Assign Azure RBAC roles to new service principals.
-- [ ] Configure Conditional Access policies in zava.com for Azure DevOps.
-- [ ] Set up MFA policies in zava.com.
-- [ ] Back up all Azure DevOps organization settings and permissions.
-- [ ] Test user sign-in to zava.com tenant (outside of Azure DevOps).
-- [ ] Send final migration notification to all users.
+| # | Status | Task | Script |
+|---|---|---|---|
+| 15 | ☐ | Provision all user accounts in the zava.com Entra ID tenant. | [01-Provision-Users.ps1](scripts/preparation/01-Provision-Users.ps1) |
+| 16 | ☐ | Verify UPN mapping between contoso.com and zava.com users. | [02-Verify-UPNMapping.ps1](scripts/preparation/02-Verify-UPNMapping.ps1) |
+| 17 | ☐ | Recreate all Entra ID security groups in zava.com. | [03-Create-Groups.ps1](scripts/preparation/03-Create-Groups.ps1) |
+| 18 | ☐ | Recreate all Entra ID Microsoft 365 groups in zava.com (if used). | [03-Create-Groups.ps1](scripts/preparation/03-Create-Groups.ps1) |
+| 19 | ☐ | Populate group memberships in zava.com. | [03-Create-Groups.ps1](scripts/preparation/03-Create-Groups.ps1) |
+| 20 | ☐ | Create all app registrations and service principals in zava.com. | [04-Create-AppRegistrations.ps1](scripts/preparation/04-Create-AppRegistrations.ps1) |
+| 21 | ☐ | Generate client secrets/certificates for new service principals. | [04-Create-AppRegistrations.ps1](scripts/preparation/04-Create-AppRegistrations.ps1) |
+| 22 | ☐ | Assign Azure RBAC roles to new service principals. | [05-Assign-RBACRoles.ps1](scripts/preparation/05-Assign-RBACRoles.ps1) |
+| 23 | ☐ | Configure Conditional Access policies in zava.com for Azure DevOps. | — |
+| 24 | ☐ | Set up MFA policies in zava.com. | — |
+| 25 | ☐ | Back up all Azure DevOps organization settings and permissions. | [06-Backup-AzDOSettings.ps1](scripts/preparation/06-Backup-AzDOSettings.ps1) |
+| 26 | ☐ | Test user sign-in to zava.com tenant (outside of Azure DevOps). | — |
+| 27 | ☐ | Send final migration notification to all users. | — |
 
 ### Migration Day
 
-- [ ] Send "migration starting" notification.
-- [ ] Pause or disable non-critical CI/CD pipelines.
-- [ ] Perform the directory switch in Azure DevOps Organization Settings.
-- [ ] Review and validate identity mappings.
-- [ ] Manually map any unmatched users.
-- [ ] Confirm the directory switch.
-- [ ] Verify Organization Owner can sign in via zava.com.
-- [ ] Verify Project Collection Administrators can sign in.
-- [ ] Spot-check several regular user accounts.
-- [ ] Send "migration complete" notification with next steps.
+| # | Status | Task | Script |
+|---|---|---|---|
+| 28 | ☐ | Send "migration starting" notification. | — |
+| 29 | ☐ | Pause or disable non-critical CI/CD pipelines. | — |
+| 30 | ☐ | Perform the directory switch in Azure DevOps Organization Settings. | — ([Portal](https://learn.microsoft.com/en-us/azure/devops/organizations/accounts/change-azure-ad-connection)) |
+| 31 | ☐ | Review and validate identity mappings. | — ([Portal](https://learn.microsoft.com/en-us/azure/devops/organizations/accounts/change-azure-ad-connection#inform-users-of-the-completed-change)) |
+| 32 | ☐ | Manually map any unmatched users. | — ([Portal](https://learn.microsoft.com/en-us/azure/devops/organizations/accounts/change-azure-ad-connection#map-remaining-users)) |
+| 33 | ☐ | Confirm the directory switch. | — ([Portal](https://learn.microsoft.com/en-us/azure/devops/organizations/accounts/change-azure-ad-connection)) |
+| 34 | ☐ | Verify Organization Owner can sign in via zava.com. | — |
+| 35 | ☐ | Verify Project Collection Administrators can sign in. | — |
+| 36 | ☐ | Spot-check several regular user accounts. | — |
+| 37 | ☐ | Send "migration complete" notification with next steps. | — |
 
 ### Post-Migration (1–2 Weeks After)
 
-- [ ] Verify all users can sign in to Azure DevOps with zava.com credentials.
-- [ ] Verify all access levels are correctly assigned.
-- [ ] Verify team and group memberships.
-- [ ] Reconfigure all service connections with zava.com service principals.
-- [ ] Validate all CI/CD pipelines run successfully.
-- [ ] Verify artifact feed access (NuGet, npm, Maven, etc.).
-- [ ] Verify Azure Artifacts upstream sources.
-- [ ] Have users regenerate PATs.
-- [ ] Have users re-add SSH keys.
-- [ ] Test all third-party integrations.
-- [ ] Validate Azure Boards queries and dashboards.
-- [ ] Validate Azure Test Plans.
-- [ ] Validate wiki access and permissions.
-- [ ] Update any documentation referencing contoso.com.
-- [ ] Update any automation scripts referencing contoso.com identities.
-- [ ] Update DNS records if applicable.
-- [ ] Monitor support channel for user-reported issues.
+| # | Status | Task | Script |
+|---|---|---|---|
+| 38 | ☐ | Verify all users can sign in to Azure DevOps with zava.com credentials. | [01-Verify-UserAccess.ps1](scripts/post-migration/01-Verify-UserAccess.ps1) |
+| 39 | ☐ | Verify all access levels are correctly assigned. | [01-Verify-UserAccess.ps1](scripts/post-migration/01-Verify-UserAccess.ps1) |
+| 40 | ☐ | Verify team and group memberships. | [01-Verify-UserAccess.ps1](scripts/post-migration/01-Verify-UserAccess.ps1) |
+| 41 | ☐ | Reconfigure all service connections with zava.com service principals. | [02-Update-ServiceConnections.ps1](scripts/post-migration/02-Update-ServiceConnections.ps1) |
+| 42 | ☐ | Validate all CI/CD pipelines run successfully. | [03-Validate-Pipelines.ps1](scripts/post-migration/03-Validate-Pipelines.ps1) |
+| 43 | ☐ | Verify artifact feed access (NuGet, npm, Maven, etc.). | [04-Validate-ArtifactFeeds.ps1](scripts/post-migration/04-Validate-ArtifactFeeds.ps1) |
+| 44 | ☐ | Verify Azure Artifacts upstream sources. | [04-Validate-ArtifactFeeds.ps1](scripts/post-migration/04-Validate-ArtifactFeeds.ps1) |
+| 45 | ☐ | Have users regenerate PATs. | — |
+| 46 | ☐ | Have users re-add SSH keys. | — |
+| 47 | ☐ | Test all third-party integrations. | — |
+| 48 | ☐ | Validate Azure Boards queries and dashboards. | — |
+| 49 | ☐ | Validate Azure Test Plans. | — |
+| 50 | ☐ | Validate wiki access and permissions. | — |
+| 51 | ☐ | Update any documentation referencing contoso.com. | — |
+| 52 | ☐ | Update any automation scripts referencing contoso.com identities. | — |
+| 53 | ☐ | Update DNS records if applicable. | — |
+| 54 | ☐ | Monitor support channel for user-reported issues. | — |
 
 ### Cleanup (2–4 Weeks After)
 
-- [ ] Remove temporary contoso.com admin accounts (if created for migration).
-- [ ] Remove old service principals from contoso.com (after confirming no dependencies).
-- [ ] Archive migration scripts and documentation.
-- [ ] Conduct post-migration retrospective.
-- [ ] Close migration project.
+| # | Status | Task | Script |
+|---|---|---|---|
+| 55 | ☐ | Remove temporary contoso.com admin accounts (if created for migration). | [01-Cleanup-SourceTenant.ps1](scripts/cleanup/01-Cleanup-SourceTenant.ps1) |
+| 56 | ☐ | Remove old service principals from contoso.com (after confirming no dependencies). | [01-Cleanup-SourceTenant.ps1](scripts/cleanup/01-Cleanup-SourceTenant.ps1) |
+| 57 | ☐ | Archive migration scripts and documentation. | — |
+| 58 | ☐ | Conduct post-migration retrospective. | — |
+| 59 | ☐ | Close migration project. | — |
 
 ---
 
