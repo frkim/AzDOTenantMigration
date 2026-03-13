@@ -10,12 +10,17 @@
 2. [Scope and Objectives](#2-scope-and-objectives)
 3. [Prerequisites and Third-Party Dependencies](#3-prerequisites-and-third-party-dependencies)
 4. [Users and Groups Migration in Microsoft Entra ID](#4-users-and-groups-migration-in-microsoft-entra-id)
-5. [Migration Plan — Prioritized Steps](#5-migration-plan--prioritized-steps)
-6. [Detailed Migration Steps](#6-detailed-migration-steps)
-7. [Leveraging AI Tools (GitHub Copilot) for Migration Automation](#7-leveraging-ai-tools-github-copilot-for-migration-automation)
-8. [Migration Checklist](#8-migration-checklist)
-9. [Rollback Plan](#9-rollback-plan)
-10. [Microsoft Official References](#10-microsoft-official-references)
+5. [Managed Identities and Workload Identity Federation](#5-managed-identities-and-workload-identity-federation)
+6. [Azure Subscription Transfer Considerations](#6-azure-subscription-transfer-considerations)
+7. [Migration Plan — Prioritized Steps](#7-migration-plan--prioritized-steps)
+8. [RACI Matrix](#8-raci-matrix)
+9. [Go/No-Go Decision Gates](#9-gono-go-decision-gates)
+10. [Detailed Migration Steps](#10-detailed-migration-steps)
+11. [Leveraging AI Tools (GitHub Copilot) for Migration Automation](#11-leveraging-ai-tools-github-copilot-for-migration-automation)
+12. [Migration Checklist](#12-migration-checklist)
+13. [Rollback Plan](#13-rollback-plan)
+14. [Audit, Compliance, and Governance](#14-audit-compliance-and-governance)
+15. [Microsoft Official References](#15-microsoft-official-references)
 
 ---
 
@@ -206,25 +211,124 @@ After migration, review and recreate (if needed) the following in the zava.com t
 
 ---
 
-## 5. Migration Plan — Prioritized Steps
+## 5. Managed Identities and Workload Identity Federation
+
+### Managed Identities
+
+Managed identities are bound to the Entra ID tenant and **cannot be migrated** across tenants. They must be handled explicitly:
+
+- **System-assigned managed identities** — These are tied to the lifecycle of an Azure resource and its tenant. If Azure resources remain in the same tenant, they continue to work. If subscriptions are being transferred to zava.com, all system-assigned managed identities are **deleted and must be re-enabled** after the transfer.
+- **User-assigned managed identities** — These are standalone Azure resources. Like system-assigned identities, they are deleted during a subscription transfer and must be recreated in the zava.com tenant.
+
+#### Impact on Azure DevOps
+
+- **Pipeline tasks using managed identities** (e.g., `AzureCLI@2` with `addSpnToEnvironment`, or Azure Key Vault tasks) will fail if the managed identity no longer exists or has different object IDs.
+- **Self-hosted agents on Azure VMs** that use managed identities to authenticate to Azure resources must have their identities reconfigured.
+- **Azure DevOps service connections of type "Managed Identity Authentication"** must be recreated pointing to the new identity.
+
+#### Actions Required
+
+```powershell
+# Inventory all user-assigned managed identities in affected subscriptions
+Get-AzUserAssignedIdentity | Select-Object Name, ResourceGroupName, PrincipalId, TenantId |
+  Export-Csv -Path "managed_identities_inventory.csv" -NoTypeInformation
+
+# After subscription transfer, recreate user-assigned managed identities
+# and update all RBAC role assignments
+```
+
+### Workload Identity Federation (Recommended for New Service Connections)
+
+Azure DevOps now supports **Workload Identity Federation** (OIDC-based) for service connections to Azure, eliminating the need for client secrets. When recreating service connections in zava.com:
+
+1. **Prefer federated credentials** over client secrets for all new app registrations.
+2. Configure the federated credential to trust the Azure DevOps organization's OIDC issuer:
+   - Issuer: `https://vstoken.dev.azure.com/{organization-id}`
+   - Subject: `sc:///{org}/{project}/{service-connection-name}`
+3. No secret rotation is required for federated service connections.
+
+```powershell
+# Create federated credential on an app registration
+$federatedCredential = @{
+    Name      = "AzDevOps-Federation"
+    Issuer    = "https://vstoken.dev.azure.com/{organization-id}"
+    Subject   = "sc:///{org}/{project}/{service-connection-name}"
+    Audiences = @("api://AzureADTokenExchange")
+}
+New-MgApplicationFederatedIdentityCredential -ApplicationId $app.Id -BodyParameter $federatedCredential
+```
+
+> 💡 **Recommendation**: Use this migration as an opportunity to upgrade all service connections from secret-based to Workload Identity Federation. This improves security posture and eliminates secret expiration risks.
+
+---
+
+## 6. Azure Subscription Transfer Considerations
+
+If Azure subscriptions linked to Azure DevOps service connections are also being transferred from contoso.com to zava.com, additional steps are required:
+
+### Impact of Subscription Transfer
+
+| Component | Impact |
+|---|---|
+| **RBAC role assignments** | All role assignments are **deleted** during transfer. Must be recreated. |
+| **System-assigned managed identities** | Disabled and must be re-enabled. New principal IDs are generated. |
+| **User-assigned managed identities** | Deleted. Must be recreated. |
+| **Key Vault access policies** | If using access policies (not RBAC), they are preserved but reference old object IDs. Must be updated. |
+| **Key Vault RBAC** | Role assignments are deleted during transfer. Must be recreated. |
+| **Storage account keys** | Not affected, but SAS tokens tied to Entra ID identities will break. |
+| **Azure SQL / Cosmos DB Entra ID admins** | Must be reconfigured with identities from zava.com. |
+| **Azure Container Registry** | RBAC role assignments removed. Must be recreated. |
+| **AKS cluster** | Cluster identity must be reconfigured. Significant operational impact. |
+
+### Transfer Sequence
+
+> ⚠️ **Critical**: Transfer subscriptions **before** switching the Azure DevOps organization directory, or ensure service connections are updated to point to the correct tenant in the correct order.
+
+1. Document all RBAC assignments in affected subscriptions (already covered in pre-migration scripts).
+2. Transfer the subscription to the zava.com tenant via the Azure portal.
+3. Recreate all RBAC role assignments.
+4. Re-enable or recreate managed identities.
+5. Update Key Vault access policies/RBAC.
+6. Validate that all Azure resources are accessible from the new tenant.
+
+### Subscriptions Not Being Transferred
+
+If subscriptions remain under contoso.com while Azure DevOps moves to zava.com:
+
+- Service connections must use **cross-tenant service principals** (multi-tenant app registrations) or be reconfigured.
+- Consider using **Azure Lighthouse** for cross-tenant resource management.
+- This adds ongoing operational complexity and should be documented as a known limitation.
+
+---
+
+## 7. Migration Plan — Prioritized Steps
 
 | Priority | Step | Description | Complexity | Risk | Estimated Duration |
 |---|---|---|---|---|---|
-| **P0** | Pre-migration assessment | Inventory all users, groups, service connections, extensions, and integrations | 🟡 Medium | 🟢 Low | 1–2 weeks |
+| **P0** | Pre-migration assessment | Inventory all users, groups, service connections, extensions, service hooks, managed identities, and integrations | 🟡 Medium | 🟢 Low | 1–2 weeks |
 | **P0** | Stakeholder communication | Notify all teams, set migration windows, and establish communication channels | 🟢 Low | 🟡 Medium | 1 week |
+| **P0** | Export audit logs | Export Azure DevOps audit logs and Entra ID sign-in logs for compliance | 🟢 Low | 🟢 Low | 1 day |
 | **P1** | Provision users in zava.com tenant | Create all user accounts in the target Entra ID tenant | 🟡 Medium | 🔴 High | 1–2 weeks |
 | **P1** | Recreate Entra ID groups in zava.com | Recreate security groups and Microsoft 365 groups | 🟡 Medium | 🔴 High | 1 week |
 | **P1** | Configure Entra ID policies | Set up Conditional Access, MFA, and security policies in zava.com | 🟡 Medium | 🔴 High | 1 week |
-| **P2** | Create service principals in zava.com | Recreate all app registrations and service principals | 🔴 High | 🔴 High | 1–2 weeks |
-| **P2** | Pre-migration backup | Export all Azure DevOps configurations, permissions, and settings | 🟡 Medium | 🟢 Low | 2–3 days |
+| **P2** | Create service principals in zava.com | Recreate all app registrations and service principals (prefer Workload Identity Federation) | 🔴 High | 🔴 High | 1–2 weeks |
+| **P2** | Transfer Azure subscriptions | Transfer subscriptions to zava.com, recreate RBAC and managed identities | 🔴 High | 🔴 High | 1–2 weeks |
+| **P2** | Pre-migration backup | Export all Azure DevOps configurations, permissions, org policies, and settings | 🟡 Medium | 🟢 Low | 2–3 days |
+| **P2** | Prepare agent re-registration | Script and test self-hosted agent re-registration with new PATs | 🟡 Medium | 🟡 Medium | 1–2 days |
+| **P3** | Go/No-Go Gate 2 | Validate all preparation criteria before proceeding to migration day | 🟢 Low | 🔴 High | 1 day |
 | **P3** | Perform directory switch | Execute the Azure DevOps organization directory change | 🔴 High | 🔴 High | 2–4 hours (downtime) |
 | **P3** | Identity mapping validation | Review and fix user identity mappings during the switch | 🔴 High | 🔴 High | 1–2 hours |
+| **P3** | Re-register self-hosted agents | Re-register all agents with new PATs immediately after switch | 🟡 Medium | 🔴 High | 1–2 hours |
 | **P4** | Post-migration: Restore permissions | Verify and fix all permission assignments | 🟡 Medium | 🔴 High | 1–2 days |
 | **P4** | Post-migration: Reconfigure service connections | Update all service connections with new service principals | 🔴 High | 🔴 High | 1–2 days |
+| **P4** | Post-migration: Update variable groups | Update Key Vault-linked variable groups and secret references | 🟡 Medium | 🔴 High | 1 day |
+| **P4** | Post-migration: Reconfigure service hooks | Update service hooks and webhooks that rely on identity auth | 🟡 Medium | 🟡 Medium | 1 day |
 | **P4** | Post-migration: Regenerate PATs and SSH keys | Users regenerate personal access tokens and SSH keys | 🟢 Low | 🟡 Medium | 1–3 days |
 | **P5** | Post-migration: Test pipelines | Run all CI/CD pipelines to verify functionality | 🟡 Medium | 🟡 Medium | 2–3 days |
 | **P5** | Post-migration: Validate integrations | Test all third-party integrations | 🟡 Medium | 🟡 Medium | 1–2 days |
+| **P5** | Post-migration: Review org policies | Verify organization policies (OAuth, SSH, guest, public projects) | 🟢 Low | 🟡 Medium | 1 day |
 | **P5** | Post-migration: User acceptance testing | Have teams validate their workflows | 🟢 Low | 🟢 Low | 1 week |
+| **P5** | Post-migration: Security sign-off | Security team reviews and signs off on new tenant posture | 🟡 Medium | 🟡 Medium | 2 days |
 | **P6** | Decommission old tenant references | Remove contoso.com references and clean up | 🟢 Low | 🟢 Low | 1 week |
 
 ### Risk Matrix
@@ -237,10 +341,90 @@ After migration, review and recreate (if needed) the following in the zava.com t
 | Extended downtime during switch | Low | High | Perform switch during off-hours; have rollback plan ready |
 | Third-party integration failures | Medium | Medium | Test integrations in a staging environment when possible |
 | PAT and SSH key invalidation disrupting automation | High | Medium | Notify users in advance; provide self-service regeneration guides |
+| Managed identities invalidated by subscription transfer | Medium | High | Inventory all managed identities; plan recreation and RBAC reassignment |
+| Self-hosted agents unable to authenticate | High | Medium | Pre-document agent registrations; prepare re-registration scripts and new PATs |
+| Service hooks and webhooks stop firing | Medium | Medium | Inventory all service hooks; update authentication after migration |
+| Organization billing disrupted | Low | High | Verify billing subscription is accessible from zava.com; update billing owner |
+| Audit trail discontinuity | Low | Medium | Export audit logs before migration; document the identity mapping for traceability |
 
 ---
 
-## 6. Detailed Migration Steps
+## 8. RACI Matrix
+
+Clear role assignments are essential for a smooth migration. Define responsibilities before execution.
+
+| Activity | Azure DevOps Org Owner | Entra ID Global Admin (Source) | Entra ID Global Admin (Target) | Azure Subscription Owner | Ops / Migration Lead | Security Team | End Users |
+|---|---|---|---|---|---|---|---|
+| Pre-migration inventory & export | I | C | C | C | **R/A** | I | — |
+| Stakeholder communication | A | I | I | I | **R** | I | I |
+| Provision users in zava.com | I | C | **R/A** | — | **R** | C | — |
+| Recreate groups in zava.com | I | C | **R/A** | — | **R** | C | — |
+| Create service principals | I | C | **R/A** | C | **R** | C | — |
+| Transfer Azure subscriptions | C | C | C | **R/A** | R | C | — |
+| Perform directory switch | **R/A** | C | C | — | R | I | I |
+| Identity mapping validation | **R/A** | C | C | — | R | — | — |
+| Reconfigure service connections | A | — | C | C | **R** | C | — |
+| Regenerate PATs and SSH keys | — | — | — | — | I | — | **R/A** |
+| Post-migration pipeline testing | A | — | — | — | **R** | — | C |
+| Rollback decision | **R/A** | C | C | C | R | C | I |
+| Security review and sign-off | I | — | I | — | C | **R/A** | — |
+
+**Legend**: **R** = Responsible, **A** = Accountable, **C** = Consulted, **I** = Informed
+
+---
+
+## 9. Go/No-Go Decision Gates
+
+Define explicit success criteria at each phase boundary to decide whether to proceed.
+
+### Gate 1 — Pre-Migration Complete → Proceed to Preparation
+
+| # | Criterion | Pass/Fail |
+|---|---|---|
+| 1 | All Azure DevOps users, groups, service connections, and extensions inventoried and exported | ☐ |
+| 2 | All third-party integrations documented | ☐ |
+| 3 | Communication plan sent to all stakeholders | ☐ |
+| 4 | Rollback plan documented and reviewed | ☐ |
+| 5 | Migration window confirmed with stakeholders | ☐ |
+
+### Gate 2 — Preparation Complete → Proceed to Migration Day
+
+| # | Criterion | Pass/Fail |
+|---|---|---|
+| 1 | 100% of in-scope users provisioned in zava.com and able to sign in | ☐ |
+| 2 | UPN mapping verified — all users have a matching identity | ☐ |
+| 3 | All Entra ID security/M365 groups recreated with correct memberships | ☐ |
+| 4 | All required app registrations and service principals created in zava.com | ☐ |
+| 5 | RBAC roles assigned to new service principals on all target Azure resources | ☐ |
+| 6 | Conditional Access and MFA policies configured and tested in zava.com | ☐ |
+| 7 | Azure DevOps settings and permissions backed up | ☐ |
+| 8 | Azure subscription transfer completed (if applicable) | ☐ |
+| 9 | Self-hosted agent re-registration plan prepared | ☐ |
+| 10 | Final user notification sent (24h before) | ☐ |
+
+### Gate 3 — Migration Day → Confirm Switch (Point of No Return)
+
+| # | Criterion | Pass/Fail |
+|---|---|---|
+| 1 | Identity mapping preview shows ≥ 95% automatic match rate | ☐ |
+| 2 | All unmapped users manually resolved | ☐ |
+| 3 | Organization Owner confirmed as mapped to zava.com identity | ☐ |
+| 4 | Rollback owner identified and available | ☐ |
+
+### Gate 4 — Post-Migration → Close Migration Project
+
+| # | Criterion | Pass/Fail |
+|---|---|---|
+| 1 | All users can sign in (verified via automated script or spot checks > 90%) | ☐ |
+| 2 | All critical CI/CD pipelines pass (build + deploy to at least one environment) | ☐ |
+| 3 | All service connections validated | ☐ |
+| 4 | No P1/P2 issues open for > 48 hours | ☐ |
+| 5 | Security team sign-off on new tenant posture | ☐ |
+| 6 | User acceptance testing completed | ☐ |
+
+---
+
+## 10. Detailed Migration Steps
 
 ### Phase 1 — Assessment and Planning (2–4 weeks before migration)
 
@@ -283,7 +467,60 @@ foreach ($group in $groups) {
 Get-MgApplication -All | Export-Csv -Path "contoso_apps.csv" -NoTypeInformation
 ```
 
-#### 1.3 Prepare Communication Plan
+#### 1.3 Inventory Service Hooks, Webhooks, and OAuth Apps
+
+Service hooks and webhooks are often overlooked and will break if they rely on identity-based authentication:
+
+```bash
+# List all service hooks per project
+az devops invoke --area hooks --resource subscriptions \
+  --organization https://dev.azure.com/{org} \
+  --route-parameters project={project} \
+  --api-version 7.1 --output json > service_hooks_export.json
+```
+
+- **Document all service hook subscriptions** (build completed, release deployed, work item updated, etc.).
+- **Inventory OAuth applications** authorized in the organization (**Organization Settings → OAuth configurations**).
+- **Review authorized third-party apps** per user (**User Settings → Authorizations**) — these authorizations are invalidated after migration.
+
+#### 1.4 Inventory Self-Hosted Agents
+
+Self-hosted agents authenticate to Azure DevOps using PATs (or certificates). After the directory switch:
+
+- **All agent PATs become invalid** — agents will go offline.
+- Agents must be **re-registered** with new PATs issued under zava.com identities.
+- For agents running as **Windows services**, the service account may need updating if it was a contoso.com domain account.
+- **Deployment group agents** require the same re-registration.
+
+```bash
+# List all agent pools and agents
+az devops invoke --area distributedtask --resource pools \
+  --organization https://dev.azure.com/{org} \
+  --api-version 7.1 --output json > agent_pools.json
+
+# For each pool, list agents
+az devops invoke --area distributedtask --resource agents \
+  --organization https://dev.azure.com/{org} \
+  --route-parameters poolId={pool-id} \
+  --api-version 7.1 --output json > agents_pool_{pool-id}.json
+```
+
+> 💡 **Tip**: Prepare a script that generates new PATs and re-registers all self-hosted agents automatically. This can dramatically reduce the post-migration recovery time from hours to minutes.
+
+#### 1.5 Inventory Variable Groups and Key Vault Links
+
+Pipeline variable groups may contain secrets or be linked to Azure Key Vault:
+
+- **Variable groups with secrets** — Secret values cannot be read via API once saved. Ensure current values are known or can be re-entered.
+- **Variable groups linked to Key Vault** — These reference a service connection and a Key Vault. Both the service connection identity and the Key Vault access policy must be updated after migration.
+- **Pipeline environment approvals and checks** — Custom gates using identity-based checks may break.
+
+```bash
+# List variable groups per project
+az pipelines variable-group list --organization https://dev.azure.com/{org} --project {project} --output json
+```
+
+#### 1.6 Prepare Communication Plan
 
 - Notify all Azure DevOps users about the upcoming migration.
 - Publish a timeline with key dates and expected downtime.
@@ -336,18 +573,41 @@ az role assignment create \
 
 - Export team and area/iteration configurations.
 - Export security/permission settings using the Azure DevOps REST API.
-- Document all pipeline variable groups and their values.
+- Document all pipeline variable groups and their values (note: secret values are not retrievable via the API).
 - Take note of repository policies and branch protection rules.
+- Export pipeline environment approvals and checks.
+- Export organization policies (**Organization Settings → Policies**): third-party app access, SSH authentication, public projects, etc.
+- Document **billing configuration** — the Azure subscription used for billing must be accessible from the new tenant.
+
+#### 2.5 Prepare Self-Hosted Agent Re-registration
+
+Prepare for rapid re-registration of all self-hosted agents after the directory switch:
+
+1. Generate a list of all agents, their pool assignments, and the machines they run on.
+2. Prepare a script to create new PATs with the `Agent Pools (read, manage)` scope.
+3. Prepare a re-registration script that can be pushed to all agent machines (e.g., via SCCM, Ansible, or a simple remote PowerShell loop).
+4. For **Microsoft-hosted agents**, no action is needed — they are managed by Azure DevOps.
+
+```powershell
+# Re-register a self-hosted agent (run on each agent machine)
+.\config.cmd remove --unattend --auth pat --token {old-pat}
+.\config.cmd --unattend --url https://dev.azure.com/{org} --auth pat --token {new-pat} --pool {pool} --agent {agent-name} --replace
+```
 
 ### Phase 3 — Execute Directory Switch (Migration Day)
 
 #### 3.1 Pre-Switch Checks
 
+- [ ] **Gate 2 passed** — All go/no-go criteria from [Section 9](#9-gono-go-decision-gates) are met.
 - [ ] Confirm all users exist in zava.com tenant.
 - [ ] Confirm all required groups exist in zava.com tenant.
 - [ ] Confirm all service principals are created in zava.com.
+- [ ] Confirm Azure subscriptions are transferred (if applicable) and RBAC is restored.
+- [ ] Confirm self-hosted agent re-registration scripts are tested and ready.
 - [ ] Confirm rollback plan is documented and ready.
+- [ ] Confirm rollback decision owner is identified and available during the window.
 - [ ] Notify all users that migration is starting.
+- [ ] Pause or disable non-critical CI/CD pipelines to avoid failures during the switch.
 
 #### 3.2 Perform the Directory Switch
 
@@ -364,9 +624,14 @@ az role assignment create \
 #### 3.3 Post-Switch Immediate Actions
 
 - Verify that the organization is connected to zava.com.
-- Test sign-in with several user accounts.
+- Test sign-in with several user accounts (from different roles: admin, contributor, stakeholder).
 - Verify Organization Owner access.
 - Check Project Collection Administrator access.
+- **Re-register all self-hosted agents** using the prepared re-registration scripts.
+- **Verify agent pools** show agents as online.
+- **Re-enable critical CI/CD pipelines** and run a smoke test build.
+- **Update organization billing** — confirm the billing subscription is accessible and billing owner is correct.
+- **Re-authorize OAuth apps** — authorize any critical third-party OAuth apps in the organization settings.
 
 ### Phase 4 — Post-Migration Validation (1–2 weeks after migration)
 
@@ -417,7 +682,7 @@ Users who use SSH for Git operations must add new SSH keys associated with their
 
 ---
 
-## 7. Leveraging AI Tools (GitHub Copilot) for Migration Automation
+## 11. Leveraging AI Tools (GitHub Copilot) for Migration Automation
 
 ### Accelerating Migration with AI-Powered Tooling
 
@@ -437,7 +702,7 @@ The operations (ops) team can significantly accelerate the Azure DevOps tenant m
 
 ---
 
-## 8. Migration Checklist
+## 12. Migration Checklist
 
 ### Migration Timeline
 
@@ -456,36 +721,52 @@ gantt
     06 Export Agent Pools                       :pre06, after pre01, 1d
     07 Export Entra ID Inventory                :pre07, after pre02, 2d
     08 Export RBAC Assignments                  :pre08, after pre04, 1d
-    Review & validate inventory                 :milestone, pre_review, after pre08, 0d
+    Export Service Hooks & Webhooks             :pre09, after pre04, 1d
+    Inventory Variable Groups & KV Links        :pre10, after pre04, 1d
+    Inventory Managed Identities                :pre11, after pre08, 1d
+    Export Audit Logs                           :pre12, after pre08, 1d
+    Gate 1 — Pre-Migration Go/No-Go            :milestone, gate1, after pre12, 0d
 
     section Phase 2 — Preparation
     01 Provision Users in target tenant         :prep01, 2026-02-27, 3d
     02 Verify UPN Mapping                       :prep02, after prep01, 1d
     03 Create Groups & memberships              :prep03, after prep02, 2d
     04 Create App Registrations & SPs           :prep04, after prep02, 2d
-    05 Assign RBAC Roles                        :prep05, after prep04, 1d
-    06 Backup AzDO Settings                     :prep06, after prep05, 1d
-    Send final migration notification           :milestone, prep_notify, after prep06, 0d
+    Configure Workload Identity Federation      :prep04b, after prep04, 1d
+    05 Assign RBAC Roles                        :prep05, after prep04b, 1d
+    Transfer Subscriptions (if applicable)      :prep05b, after prep05, 2d
+    Recreate Managed Identities                 :prep05c, after prep05b, 1d
+    06 Backup AzDO Settings & Org Policies      :prep06, after prep05c, 1d
+    Prepare Agent Re-registration Scripts       :prep07, after prep06, 1d
+    Gate 2 — Preparation Go/No-Go              :milestone, gate2, after prep07, 0d
 
     section Phase 3 — Migration Day
-    Pre-switch checks                           :crit, mig01, 2026-03-13, 1h
+    Pre-switch checks & Gate 3                  :crit, mig01, 2026-03-13, 1h
     Perform directory switch                    :crit, mig02, after mig01, 2h
     Validate identity mappings                  :crit, mig03, after mig02, 1h
-    Verify admin sign-in                        :crit, mig04, after mig03, 1h
+    Verify admin sign-in                        :crit, mig04, after mig03, 30min
+    Re-register self-hosted agents              :crit, mig05, after mig04, 1h
+    Smoke test critical pipeline                :crit, mig06, after mig05, 30min
 
     section Phase 4 — Post-Migration
     01 Verify User Access                       :post01, 2026-03-14, 2d
     02 Update Service Connections               :post02, after post01, 2d
-    03 Validate Pipelines                       :post03, after post02, 3d
+    Update Variable Groups & KV Links           :post02b, after post02, 1d
+    03 Validate Pipelines                       :post03, after post02b, 3d
     04 Validate Artifact Feeds                  :post04, after post02, 1d
+    Reconfigure Service Hooks & Webhooks        :post05, after post02, 1d
+    Re-authorize OAuth Apps                     :post06, after post01, 1d
+    Review Organization Policies                :post07, after post01, 1d
     Users regenerate PATs & SSH keys            :post_pats, after post01, 5d
     Test third-party integrations               :post_integ, after post03, 2d
     User acceptance testing                     :post_uat, after post_integ, 5d
+    Security team sign-off                      :post_sec, after post_uat, 2d
+    Gate 4 — Post-Migration Go/No-Go           :milestone, gate4, after post_sec, 0d
 
     section Phase 5 — Cleanup
     01 Cleanup Source Tenant (dry run)          :clean01, 2026-04-10, 1d
     01 Cleanup Source Tenant (execute)          :clean02, after clean01, 1d
-    Archive migration documentation             :clean03, after clean02, 2d
+    Archive migration docs & audit logs         :clean03, after clean02, 2d
     Post-migration retrospective                :milestone, retro, after clean03, 0d
 ```
 
@@ -504,9 +785,17 @@ gantt
 | 9 | ☐ | Document all third-party integrations (GitHub, Slack, SonarQube, etc.). | — |
 | 10 | ☐ | Document all Azure RBAC role assignments for service principals. | [08-Export-RBACAssignments.ps1](scripts/pre-migration/08-Export-RBACAssignments.ps1) |
 | 11 | ☐ | Export Entra ID users, groups, and app registrations from source tenant. | [07-Export-EntraIDInventory.ps1](scripts/pre-migration/07-Export-EntraIDInventory.ps1) |
-| 12 | ☐ | Create a communication plan and notify all stakeholders. | — |
-| 13 | ☐ | Schedule the migration window (off-hours recommended). | — |
-| 14 | ☐ | Document the rollback plan. | — |
+| 12 | ☐ | Inventory all service hooks and webhook subscriptions across all projects. | — |
+| 13 | ☐ | Inventory all OAuth app authorizations in the organization. | — |
+| 14 | ☐ | Inventory all self-hosted agents, deployment group agents, and their machine locations. | — |
+| 15 | ☐ | Inventory all variable groups, noting Key Vault-linked groups and secret values. | — |
+| 16 | ☐ | Inventory all managed identities (system/user-assigned) used by pipelines. | — |
+| 17 | ☐ | Export Azure DevOps audit logs for compliance record. | — |
+| 18 | ☐ | Document current organization billing subscription and owner. | — |
+| 19 | ☐ | Create a communication plan and notify all stakeholders. | — |
+| 20 | ☐ | Schedule the migration window (off-hours recommended). | — |
+| 21 | ☐ | Document the rollback plan and assign rollback decision owner. | — |
+| 22 | ☐ | **Pass Gate 1** — Pre-Migration Go/No-Go ([Section 9](#9-gono-go-decision-gates)). | — |
 
 ### Preparation (1–2 Weeks Before)
 
@@ -520,75 +809,180 @@ gantt
 | 20 | ☐ | Create all app registrations and service principals in zava.com. | [04-Create-AppRegistrations.ps1](scripts/preparation/04-Create-AppRegistrations.ps1) |
 | 21 | ☐ | Generate client secrets/certificates for new service principals. | [04-Create-AppRegistrations.ps1](scripts/preparation/04-Create-AppRegistrations.ps1) |
 | 22 | ☐ | Assign Azure RBAC roles to new service principals. | [05-Assign-RBACRoles.ps1](scripts/preparation/05-Assign-RBACRoles.ps1) |
-| 23 | ☐ | Configure Conditional Access policies in zava.com for Azure DevOps. | — |
-| 24 | ☐ | Set up MFA policies in zava.com. | — |
-| 25 | ☐ | Back up all Azure DevOps organization settings and permissions. | [06-Backup-AzDOSettings.ps1](scripts/preparation/06-Backup-AzDOSettings.ps1) |
-| 26 | ☐ | Test user sign-in to zava.com tenant (outside of Azure DevOps). | — |
-| 27 | ☐ | Send final migration notification to all users. | — |
+| 23 | ☐ | Configure Workload Identity Federation for new service connections (recommended). | — |
+| 24 | ☐ | Configure Conditional Access policies in zava.com for Azure DevOps. | — |
+| 25 | ☐ | Set up MFA policies in zava.com. | — |
+| 26 | ☐ | Back up all Azure DevOps organization settings and permissions. | [06-Backup-AzDOSettings.ps1](scripts/preparation/06-Backup-AzDOSettings.ps1) |
+| 27 | ☐ | Back up organization policy settings (OAuth, SSH, guest access, etc.). | — |
+| 28 | ☐ | Transfer Azure subscriptions to zava.com (if applicable). | — |
+| 29 | ☐ | Recreate RBAC assignments on transferred subscriptions. | — |
+| 30 | ☐ | Recreate/re-enable managed identities on transferred subscriptions. | — |
+| 31 | ☐ | Prepare self-hosted agent re-registration scripts. | — |
+| 32 | ☐ | Test user sign-in to zava.com tenant (outside of Azure DevOps). | — |
+| 33 | ☐ | Send final migration notification to all users (24h before). | — |
+| 34 | ☐ | **Pass Gate 2** — Preparation Go/No-Go ([Section 9](#9-gono-go-decision-gates)). | — |
 
 ### Migration Day
 
 | # | Status | Task | Script |
 |---|---|---|---|
-| 28 | ☐ | Send "migration starting" notification. | — |
-| 29 | ☐ | Pause or disable non-critical CI/CD pipelines. | — |
-| 30 | ☐ | Perform the directory switch in Azure DevOps Organization Settings. | — ([Portal](https://learn.microsoft.com/en-us/azure/devops/organizations/accounts/change-azure-ad-connection)) |
-| 31 | ☐ | Review and validate identity mappings. | — ([Portal](https://learn.microsoft.com/en-us/azure/devops/organizations/accounts/change-azure-ad-connection#inform-users-of-the-completed-change)) |
-| 32 | ☐ | Manually map any unmatched users. | — ([Portal](https://learn.microsoft.com/en-us/azure/devops/organizations/accounts/change-azure-ad-connection#map-remaining-users)) |
-| 33 | ☐ | Confirm the directory switch. | — ([Portal](https://learn.microsoft.com/en-us/azure/devops/organizations/accounts/change-azure-ad-connection)) |
-| 34 | ☐ | Verify Organization Owner can sign in via zava.com. | — |
-| 35 | ☐ | Verify Project Collection Administrators can sign in. | — |
-| 36 | ☐ | Spot-check several regular user accounts. | — |
-| 37 | ☐ | Send "migration complete" notification with next steps. | — |
+| 35 | ☐ | Send "migration starting" notification. | — |
+| 36 | ☐ | Pause or disable non-critical CI/CD pipelines. | — |
+| 37 | ☐ | Perform the directory switch in Azure DevOps Organization Settings. | — ([Portal](https://learn.microsoft.com/en-us/azure/devops/organizations/accounts/change-azure-ad-connection)) |
+| 38 | ☐ | Review and validate identity mappings (**Gate 3**: ≥ 95% match rate). | — ([Portal](https://learn.microsoft.com/en-us/azure/devops/organizations/accounts/change-azure-ad-connection#inform-users-of-the-completed-change)) |
+| 39 | ☐ | Manually map any unmatched users. | — ([Portal](https://learn.microsoft.com/en-us/azure/devops/organizations/accounts/change-azure-ad-connection#map-remaining-users)) |
+| 40 | ☐ | **Pass Gate 3** — Confirm switch Go/No-Go ([Section 9](#9-gono-go-decision-gates)). | — |
+| 41 | ☐ | Confirm the directory switch. | — ([Portal](https://learn.microsoft.com/en-us/azure/devops/organizations/accounts/change-azure-ad-connection)) |
+| 42 | ☐ | Verify Organization Owner can sign in via zava.com. | — |
+| 43 | ☐ | Verify Project Collection Administrators can sign in. | — |
+| 44 | ☐ | Re-register all self-hosted agents with new PATs. | — |
+| 45 | ☐ | Verify agent pools show agents online. | — |
+| 46 | ☐ | Run smoke test build on a critical pipeline. | — |
+| 47 | ☐ | Verify organization billing is functional. | — |
+| 48 | ☐ | Spot-check several regular user accounts. | — |
+| 49 | ☐ | Send "migration complete" notification with next steps. | — |
 
 ### Post-Migration (1–2 Weeks After)
 
 | # | Status | Task | Script |
 |---|---|---|---|
-| 38 | ☐ | Verify all users can sign in to Azure DevOps with zava.com credentials. | [01-Verify-UserAccess.ps1](scripts/post-migration/01-Verify-UserAccess.ps1) |
-| 39 | ☐ | Verify all access levels are correctly assigned. | [01-Verify-UserAccess.ps1](scripts/post-migration/01-Verify-UserAccess.ps1) |
-| 40 | ☐ | Verify team and group memberships. | [01-Verify-UserAccess.ps1](scripts/post-migration/01-Verify-UserAccess.ps1) |
-| 41 | ☐ | Reconfigure all service connections with zava.com service principals. | [02-Update-ServiceConnections.ps1](scripts/post-migration/02-Update-ServiceConnections.ps1) |
-| 42 | ☐ | Validate all CI/CD pipelines run successfully. | [03-Validate-Pipelines.ps1](scripts/post-migration/03-Validate-Pipelines.ps1) |
-| 43 | ☐ | Verify artifact feed access (NuGet, npm, Maven, etc.). | [04-Validate-ArtifactFeeds.ps1](scripts/post-migration/04-Validate-ArtifactFeeds.ps1) |
-| 44 | ☐ | Verify Azure Artifacts upstream sources. | [04-Validate-ArtifactFeeds.ps1](scripts/post-migration/04-Validate-ArtifactFeeds.ps1) |
-| 45 | ☐ | Have users regenerate PATs. | — |
-| 46 | ☐ | Have users re-add SSH keys. | — |
-| 47 | ☐ | Test all third-party integrations. | — |
-| 48 | ☐ | Validate Azure Boards queries and dashboards. | — |
-| 49 | ☐ | Validate Azure Test Plans. | — |
-| 50 | ☐ | Validate wiki access and permissions. | — |
-| 51 | ☐ | Update any documentation referencing contoso.com. | — |
-| 52 | ☐ | Update any automation scripts referencing contoso.com identities. | — |
-| 53 | ☐ | Update DNS records if applicable. | — |
-| 54 | ☐ | Monitor support channel for user-reported issues. | — |
+| 50 | ☐ | Verify all users can sign in to Azure DevOps with zava.com credentials. | [01-Verify-UserAccess.ps1](scripts/post-migration/01-Verify-UserAccess.ps1) |
+| 51 | ☐ | Verify all access levels are correctly assigned. | [01-Verify-UserAccess.ps1](scripts/post-migration/01-Verify-UserAccess.ps1) |
+| 52 | ☐ | Verify team and group memberships. | [01-Verify-UserAccess.ps1](scripts/post-migration/01-Verify-UserAccess.ps1) |
+| 53 | ☐ | Reconfigure all service connections with zava.com service principals (prefer Workload Identity Federation). | [02-Update-ServiceConnections.ps1](scripts/post-migration/02-Update-ServiceConnections.ps1) |
+| 54 | ☐ | Update variable groups linked to Key Vault (update service connection reference and Key Vault access). | — |
+| 55 | ☐ | Validate all CI/CD pipelines run successfully. | [03-Validate-Pipelines.ps1](scripts/post-migration/03-Validate-Pipelines.ps1) |
+| 56 | ☐ | Verify artifact feed access (NuGet, npm, Maven, etc.). | [04-Validate-ArtifactFeeds.ps1](scripts/post-migration/04-Validate-ArtifactFeeds.ps1) |
+| 57 | ☐ | Verify Azure Artifacts upstream sources. | [04-Validate-ArtifactFeeds.ps1](scripts/post-migration/04-Validate-ArtifactFeeds.ps1) |
+| 58 | ☐ | Reconfigure service hooks and webhooks that use identity-based auth. | — |
+| 59 | ☐ | Re-authorize OAuth applications in organization settings. | — |
+| 60 | ☐ | Verify organization policies are correct (OAuth, SSH, guest access, public projects). | — |
+| 61 | ☐ | Have users regenerate PATs. | — |
+| 62 | ☐ | Have users re-add SSH keys. | — |
+| 63 | ☐ | Test all third-party integrations. | — |
+| 64 | ☐ | Validate Azure Boards queries and dashboards. | — |
+| 65 | ☐ | Validate Azure Test Plans. | — |
+| 66 | ☐ | Validate wiki access and permissions. | — |
+| 67 | ☐ | Update pipeline environment approvals and checks if identity-dependent. | — |
+| 68 | ☐ | Update any documentation referencing contoso.com. | — |
+| 69 | ☐ | Update any automation scripts referencing contoso.com identities. | — |
+| 70 | ☐ | Update DNS records if applicable. | — |
+| 71 | ☐ | Monitor support channel for user-reported issues. | — |
+| 72 | ☐ | **Pass Gate 4** — Post-Migration Go/No-Go ([Section 9](#9-gono-go-decision-gates)). | — |
 
 ### Cleanup (2–4 Weeks After)
 
 | # | Status | Task | Script |
 |---|---|---|---|
-| 55 | ☐ | Remove temporary contoso.com admin accounts (if created for migration). | [01-Cleanup-SourceTenant.ps1](scripts/cleanup/01-Cleanup-SourceTenant.ps1) |
-| 56 | ☐ | Remove old service principals from contoso.com (after confirming no dependencies). | [01-Cleanup-SourceTenant.ps1](scripts/cleanup/01-Cleanup-SourceTenant.ps1) |
-| 57 | ☐ | Archive migration scripts and documentation. | — |
-| 58 | ☐ | Conduct post-migration retrospective. | — |
-| 59 | ☐ | Close migration project. | — |
+| 73 | ☐ | Remove temporary contoso.com admin accounts (if created for migration). | [01-Cleanup-SourceTenant.ps1](scripts/cleanup/01-Cleanup-SourceTenant.ps1) |
+| 74 | ☐ | Remove old service principals from contoso.com (after confirming no dependencies). | [01-Cleanup-SourceTenant.ps1](scripts/cleanup/01-Cleanup-SourceTenant.ps1) |
+| 75 | ☐ | Disable contoso.com user accounts no longer needed. | — |
+| 76 | ☐ | Remove contoso.com Entra ID groups no longer needed. | — |
+| 77 | ☐ | Archive migration scripts, exports, identity mapping, and audit logs. | — |
+| 78 | ☐ | Conduct post-migration retrospective. | — |
+| 79 | ☐ | Document lessons learned. | — |
+| 80 | ☐ | Close migration project. | — |
 
 ---
 
-## 9. Rollback Plan
+## 13. Rollback Plan
 
-In case the directory switch causes critical issues that cannot be resolved:
+### Rollback Trigger Criteria
 
-1. **Azure DevOps allows switching back** to the original directory within a limited time frame. The Organization Owner can navigate to **Organization Settings → Azure Active Directory** and switch back to contoso.com.
-2. Ensure contoso.com user accounts are **not deleted or disabled** during the migration window.
-3. Keep all contoso.com service principals and app registrations active until the migration is fully validated.
-4. Document the exact rollback steps and assign a rollback owner before starting the migration.
+Initiate rollback if **any** of the following conditions are met within the rollback window:
 
-> ⚠️ **Note**: Switching back will also require users to use their original contoso.com credentials. Any changes made in Azure DevOps after the switch (new PATs, updated permissions) may be lost.
+| # | Trigger | Severity |
+|---|---|---|
+| 1 | Organization Owner cannot sign in after the switch | 🔴 Critical |
+| 2 | More than 20% of users fail identity mapping (unmapped/mismatched) | 🔴 Critical |
+| 3 | The directory switch process itself fails or hangs | 🔴 Critical |
+| 4 | Critical production pipelines cannot run and service connections cannot be quickly reconfigured | 🔴 Critical |
+| 5 | Azure DevOps portal shows errors or data inconsistencies (missing projects, repos) | 🔴 Critical |
+
+### Rollback Decision Authority
+
+- **Rollback Owner**: Azure DevOps Organization Owner (with backup designee).
+- **Rollback decision** must be made within **4 hours** of the directory switch. After this window, reverting becomes significantly more complex.
+- Rollback requires consensus from: Org Owner, Migration Lead, and Security Team lead.
+
+### Rollback Window
+
+> ⚠️ **Critical**: Azure DevOps provides a **disconnect** operation that allows switching back to a different directory. However, this process works best when invoked **as soon as possible** after the original switch. The longer post-migration changes accumulate (new PATs, updated permissions, new service connections), the more disruptive a rollback becomes.
+
+### Rollback Procedure
+
+1. **Announce rollback** to all stakeholders via the established communication channel.
+2. Sign in to [Azure DevOps](https://dev.azure.com) as the **Organization Owner** using the zava.com identity.
+3. Navigate to **Organization Settings → Azure Active Directory**.
+4. Click **Disconnect directory** to remove zava.com.
+5. Reconnect to **contoso.com** tenant.
+6. Validate identity mappings revert to contoso.com UPNs.
+7. Confirm Organization Owner and PCA access.
+8. **Re-register self-hosted agents** with contoso.com PATs.
+9. **Restore service connections** to contoso.com service principals.
+10. Send "rollback complete" notification to all users.
+
+### Post-Rollback Actions
+
+- Conduct a root cause analysis of why migration failed.
+- Update the migration plan to address the identified issues.
+- Schedule a new migration window.
+- Do **not** delete any zava.com identities or service principals — they will be needed for the next attempt.
+
+### Preserving Rollback Capability
+
+- Keep all contoso.com user accounts **active and licensed** for at least 30 days after migration.
+- Keep all contoso.com service principals and app registrations active until Gate 4 is passed.
+- Do not delete or rename any contoso.com Entra ID groups until the migration project is formally closed.
+- Maintain at least one Global Administrator account in contoso.com that can perform the rollback.
 
 ---
 
-## 10. Microsoft Official References
+## 14. Audit, Compliance, and Governance
+
+### Preserving Audit Trail
+
+The Azure DevOps audit log continues to function after a directory switch, but identity references may change. To maintain traceability:
+
+1. **Export Azure DevOps audit logs** before the migration:
+   ```bash
+   # Export audit logs via REST API
+   az devops invoke --area audit --resource auditlog \
+     --organization https://dev.azure.com/{org} \
+     --api-version 7.1 --output json > audit_log_pre_migration.json
+   ```
+2. **Document the identity mapping** (old UPN → new UPN) and store it alongside the audit export. This allows future investigators to correlate pre-migration audit entries with post-migration identities.
+3. **Export Entra ID sign-in logs** and **audit logs** from the contoso.com tenant for the period leading up to migration.
+
+### Compliance Considerations
+
+| Concern | Action |
+|---|---|
+| **SOC 2 / ISO 27001** | Document the migration as a change event in your ISMS. Include risk assessment and approvals. |
+| **GDPR / Data Residency** | Verify that the Azure DevOps organization region does not change during a directory switch (it doesn't). Confirm user data handling aligns with data processing agreements under the new tenant. |
+| **License compliance** | Ensure all users in zava.com have appropriate Visual Studio or Azure DevOps licenses. An unlicensed user mapped during migration may lose access. |
+| **Privileged access** | Review that Privileged Identity Management (PIM) or Just-In-Time (JIT) access is configured in zava.com for admin roles. |
+
+### Organization Policy Review
+
+After the directory switch, verify that **Organization Policies** are still configured as intended:
+
+- **Third-party application access via OAuth** — May be reset; re-enable if needed.
+- **SSH authentication** — Policy setting persists, but keys must be regenerated.
+- **Allow public projects** — Review and confirm.
+- **External guest access** — Review the "External guest access" policy and ensure it matches your new tenant's security posture.
+- **Restrict organization creation** — If using Entra ID policies to restrict Azure DevOps org creation in the new tenant, verify this is configured.
+
+### Governance Best Practices
+
+- Assign a **migration project owner** who is accountable for the end-to-end process.
+- Maintain a **migration decision log** recording all key decisions, their rationale, and who approved them.
+- Conduct a **post-migration retrospective** within 2 weeks of closing the migration project.
+- Archive all migration scripts, exports, and documentation in a dedicated repository with appropriate retention policies.
+
+---
+
+## 15. Microsoft Official References
 
 ### Azure DevOps Documentation
 
@@ -623,6 +1017,6 @@ In case the directory switch causes critical issues that cannot be resolved:
 
 ---
 
-*Document version: 1.0*
+*Document version: 2.0*
 *Last updated: 2026-03-13*
 *Author: Migration Team*
