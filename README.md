@@ -36,7 +36,7 @@ Migrate the backing directory of an Azure DevOps Services organization from the 
 
 ## Migration Plan
 
-See [AzDO-Migration-Plan.md](AzDO-Migration-Plan.md) for the full plan, including:
+See [AzDO-Migration-Plan.md](AzDO-Migration-Plan.md) for the full plan (v3.0), including:
 
 | Section | Topic |
 |---------|-------|
@@ -44,12 +44,17 @@ See [AzDO-Migration-Plan.md](AzDO-Migration-Plan.md) for the full plan, includin
 | 2 | Scope and Objectives |
 | 3 | Prerequisites and Third-Party Dependencies |
 | 4 | Users and Groups Migration in Microsoft Entra ID |
-| 5 | Migration Plan — Prioritized Steps |
-| 6 | Detailed Migration Steps |
-| 7 | Leveraging AI Tools (GitHub Copilot) for Automation |
-| 8 | **Migration Checklist** — 59 numbered items with script links & Gantt timeline |
-| 9 | Rollback Plan |
-| 10 | Microsoft Official References |
+| 5 | Managed Identities and Workload Identity Federation |
+| 6 | Azure Subscription Transfer Process |
+| 7 | Migration Plan — Prioritized Steps |
+| 8 | RACI Matrix |
+| 9 | Go/No-Go Decision Gates |
+| 10 | Detailed Migration Steps |
+| 11 | Leveraging AI Tools (GitHub Copilot) for Automation |
+| 12 | **Migration Checklist** — 80+ numbered items with script links & Gantt timeline |
+| 13 | Rollback Plan |
+| 14 | Audit, Compliance, and Governance |
+| 15 | Microsoft Official References |
 
 ## Automation Scripts
 
