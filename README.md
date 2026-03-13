@@ -1,4 +1,4 @@
-# AzDOTenantMigration
+# Azure DevOps Directory Migration
 
 This project describes the steps to migrate the directory of an Azure DevOps Services organization from one Microsoft Entra ID (Azure AD) tenant to another.
 
