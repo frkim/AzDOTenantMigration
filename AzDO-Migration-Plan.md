@@ -11,7 +11,7 @@
 3. [Prerequisites and Third-Party Dependencies](#3-prerequisites-and-third-party-dependencies)
 4. [Users and Groups Migration in Microsoft Entra ID](#4-users-and-groups-migration-in-microsoft-entra-id)
 5. [Managed Identities and Workload Identity Federation](#5-managed-identities-and-workload-identity-federation)
-6. [Azure Subscription Transfer Considerations](#6-azure-subscription-transfer-considerations)
+6. [Azure Subscription Transfer Process](#6-azure-subscription-transfer-process)
 7. [Migration Plan — Prioritized Steps](#7-migration-plan--prioritized-steps)
 8. [RACI Matrix](#8-raci-matrix)
 9. [Go/No-Go Decision Gates](#9-gono-go-decision-gates)
@@ -40,6 +40,7 @@ Changing the backing directory of an Azure DevOps organization is a significant 
 - Migration and mapping of user identities and group memberships.
 - Re-establishment of permissions, access levels, and security configurations.
 - Migration of service connections, service principals, and managed identities.
+- **Transfer of Azure subscriptions** from contoso.com to zava.com tenant (including RBAC, managed identities, Key Vault, and all dependent resource reconfigurations).
 - Update of all third-party integrations and extensions.
 - Validation and post-migration testing.
 
@@ -47,6 +48,21 @@ Changing the backing directory of an Azure DevOps organization is a significant 
 
 - Azure DevOps Server (on-premises) migrations.
 - Migration of Azure DevOps data (repos, pipelines, work items) between organizations — data remains in the same organization; only the backing directory changes.
+- Migration of Azure resources that are not linked to Azure DevOps (handled by separate infrastructure migration projects).
+
+### Key Decision — Azure Subscription Transfer
+
+> ⚠️ **This decision must be made before Phase 2 begins and directly impacts the migration scope, timeline, and risk profile.**
+
+An Azure DevOps directory switch **does not inherently require** migrating Azure subscriptions. They are independent operations. However, the decision has significant downstream consequences:
+
+| Scenario | Description | Impact on Migration |
+|---|---|---|
+| **A — Subscriptions move to zava.com** | All Azure subscriptions linked to service connections transfer to the new tenant. | Adds 1–2 weeks of preparation. RBAC, managed identities, Key Vault, AKS, SQL, and other resources must be reconfigured. **This plan assumes Scenario A.** |
+| **B — Subscriptions stay in contoso.com** | Azure infrastructure remains under the original tenant. | Simpler migration. Requires cross-tenant service principals (multi-tenant app registrations) or Azure Lighthouse. Adds ongoing operational complexity. |
+| **C — Mixed** | Some subscriptions move, others stay. | Both patterns apply simultaneously. Most complex operationally. |
+
+This plan documents the **full process for Scenario A** (subscription transfer) in [Section 6](#6-azure-subscription-transfer-process). If Scenario B or C applies, the subscription transfer steps can be marked as N/A or adapted accordingly.
 
 ### Objectives
 
@@ -262,42 +278,403 @@ New-MgApplicationFederatedIdentityCredential -ApplicationId $app.Id -BodyParamet
 
 ---
 
-## 6. Azure Subscription Transfer Considerations
+## 6. Azure Subscription Transfer Process
 
-If Azure subscriptions linked to Azure DevOps service connections are also being transferred from contoso.com to zava.com, additional steps are required:
+Transferring Azure subscriptions from contoso.com to zava.com is a **prerequisite** for the Azure DevOps directory switch when pipelines deploy to Azure resources that must be managed under the new tenant. This section provides the complete end-to-end process.
 
-### Impact of Subscription Transfer
+> ⚠️ **Critical**: Transfer subscriptions **before** switching the Azure DevOps organization directory. Service connections referencing these subscriptions will be reconfigured to use zava.com service principals in Phase 4 (post-migration).
 
-| Component | Impact |
+### 6.1 Prerequisites for Subscription Transfer
+
+| Prerequisite | Description |
 |---|---|
-| **RBAC role assignments** | All role assignments are **deleted** during transfer. Must be recreated. |
-| **System-assigned managed identities** | Disabled and must be re-enabled. New principal IDs are generated. |
-| **User-assigned managed identities** | Deleted. Must be recreated. |
-| **Key Vault access policies** | If using access policies (not RBAC), they are preserved but reference old object IDs. Must be updated. |
-| **Key Vault RBAC** | Role assignments are deleted during transfer. Must be recreated. |
-| **Storage account keys** | Not affected, but SAS tokens tied to Entra ID identities will break. |
-| **Azure SQL / Cosmos DB Entra ID admins** | Must be reconfigured with identities from zava.com. |
-| **Azure Container Registry** | RBAC role assignments removed. Must be recreated. |
-| **AKS cluster** | Cluster identity must be reconfigured. Significant operational impact. |
+| **Source tenant access** | Global Administrator in contoso.com OR Owner on the subscription |
+| **Target tenant access** | Global Administrator in zava.com OR a user with the `Microsoft.Subscription/accept/action` permission |
+| **No Azure Prepayment (Enterprise Agreement)** | EA subscriptions require EA enrollment admin action to transfer. Contact your EA admin first. |
+| **No active Azure Support plans** | Support plans cannot be transferred and must be cancelled/re-purchased. |
+| **No Azure Marketplace purchases** | Some Marketplace resources do not support transfer and may need re-provisioning. |
+| **Billing check** | Verify the subscription has no outstanding balance. Azure DevOps billing subscription must remain functioning throughout. |
 
-### Transfer Sequence
+### 6.2 Impact Assessment — What Breaks During Transfer
 
-> ⚠️ **Critical**: Transfer subscriptions **before** switching the Azure DevOps organization directory, or ensure service connections are updated to point to the correct tenant in the correct order.
+When a subscription changes tenant, the following are **immediately affected**:
 
-1. Document all RBAC assignments in affected subscriptions (already covered in pre-migration scripts).
-2. Transfer the subscription to the zava.com tenant via the Azure portal.
-3. Recreate all RBAC role assignments.
-4. Re-enable or recreate managed identities.
-5. Update Key Vault access policies/RBAC.
-6. Validate that all Azure resources are accessible from the new tenant.
+| Component | Impact | Severity | Recovery Action |
+|---|---|---|---|
+| **All RBAC role assignments** | **Deleted** — every custom and built-in role assignment on the subscription, resource groups, and resources is removed. | 🔴 Critical | Restore from exported role assignments (pre-migration scripts). |
+| **System-assigned managed identities** | **Disabled** — the identity is detached and receives a new principal ID when re-enabled. | 🔴 Critical | Re-enable on each resource; update all references to the new principal ID. |
+| **User-assigned managed identities** | **Deleted** — the resource is removed during transfer. | 🔴 Critical | Recreate in the target tenant; reassign to resources; recreate RBAC. |
+| **Key Vault access policies** | **Preserved** but reference old tenant object IDs — no longer resolve. | 🔴 Critical | Update each access policy with new object IDs from zava.com. |
+| **Key Vault RBAC** | **Deleted** with other role assignments. | 🔴 Critical | Recreate RBAC role assignments for Key Vault data plane access. |
+| **Azure SQL Entra ID admin** | Admin references old tenant identity — authentication fails. | 🔴 Critical | Reconfigure Entra ID admin with zava.com identity. |
+| **Cosmos DB Entra ID auth** | RBAC assignments deleted; Entra ID-based auth fails. | 🟡 High | Recreate RBAC assignments with new identity object IDs. |
+| **Azure Container Registry (ACR)** | RBAC removed; pull/push operations using Entra ID auth fail. | 🟡 High | Recreate RBAC (AcrPull, AcrPush) for service principals and managed identities. |
+| **AKS cluster** | Cluster identity and kubelet identity become invalid. Nodepool scaling, pod identity, and Key Vault integration break. | 🔴 Critical | Update cluster identity; rotate credentials; reconfigure pod identity/workload identity. |
+| **App Service / Function App** | System-assigned identity disabled; Key Vault references, managed identity-based connections break. | 🟡 High | Re-enable system identity; update Key Vault references; reconfigure auth. |
+| **Storage account SAS (Entra ID-based)** | Entra ID-based SAS tokens become invalid. Account keys are unaffected. | 🟡 Medium | Regenerate SAS tokens with new identities or use account keys. |
+| **Virtual Network / NSG** | No identity impact. Rules preserved. | 🟢 None | No action required. |
+| **DNS zones** | No identity impact. Records preserved. | 🟢 None | No action required. |
+| **Azure Monitor / Log Analytics** | RBAC removed; alert action groups referencing identity-based targets may break. | 🟡 Medium | Recreate RBAC; verify alert action groups. |
+| **Azure DevOps billing** | If this subscription is used for Azure DevOps billing, billing must remain functional. | 🔴 Critical | Verify billing continues to work after transfer; update billing owner identity. |
 
-### Subscriptions Not Being Transferred
+### 6.3 Pre-Transfer Inventory and Export
 
-If subscriptions remain under contoso.com while Azure DevOps moves to zava.com:
+Before transferring any subscription, export everything that will be lost:
 
-- Service connections must use **cross-tenant service principals** (multi-tenant app registrations) or be reconfigured.
-- Consider using **Azure Lighthouse** for cross-tenant resource management.
-- This adds ongoing operational complexity and should be documented as a known limitation.
+```powershell
+# --- 1. Export ALL RBAC role assignments for the subscription ---
+$subscriptionId = "{subscription-id}"
+Get-AzRoleAssignment -Scope "/subscriptions/$subscriptionId" |
+  Select-Object DisplayName, SignInName, ObjectId, ObjectType, RoleDefinitionName, Scope |
+  Export-Csv -Path "rbac_assignments_$subscriptionId.csv" -NoTypeInformation
+
+# --- 2. Export custom role definitions ---
+Get-AzRoleDefinition -Custom -Scope "/subscriptions/$subscriptionId" |
+  ConvertTo-Json -Depth 10 | Out-File "custom_roles_$subscriptionId.json"
+
+# --- 3. Export managed identities ---
+# System-assigned: list resources with identity enabled
+Get-AzResource -ResourceType "Microsoft.ManagedIdentity/userAssignedIdentities" |
+  Select-Object Name, ResourceGroupName, Location |
+  Export-Csv -Path "user_assigned_mi_$subscriptionId.csv" -NoTypeInformation
+
+# Identify resources with system-assigned identity enabled
+Get-AzResource | Where-Object { $_.Identity.Type -match "SystemAssigned" } |
+  Select-Object Name, ResourceType, ResourceGroupName, @{N='PrincipalId';E={$_.Identity.PrincipalId}} |
+  Export-Csv -Path "system_assigned_mi_$subscriptionId.csv" -NoTypeInformation
+
+# --- 4. Export Key Vault access policies ---
+foreach ($vault in (Get-AzKeyVault)) {
+    $kv = Get-AzKeyVault -VaultName $vault.VaultName
+    $kv.AccessPolicies | Select-Object @{N='VaultName';E={$vault.VaultName}}, ObjectId, Permissions |
+      Export-Csv -Path "keyvault_access_$($vault.VaultName).csv" -NoTypeInformation -Append
+}
+
+# --- 5. Export Azure SQL Entra ID administrators ---
+Get-AzSqlServer | ForEach-Object {
+    Get-AzSqlServerActiveDirectoryAdministrator -ServerName $_.ServerName -ResourceGroupName $_.ResourceGroupName
+} | Export-Csv -Path "sql_ad_admins_$subscriptionId.csv" -NoTypeInformation
+
+# --- 6. Export AKS cluster identity details ---
+Get-AzAksCluster | Select-Object Name, ResourceGroupName,
+  @{N='IdentityType';E={$_.Identity.Type}},
+  @{N='IdentityPrincipalId';E={$_.Identity.PrincipalId}},
+  @{N='KubeletIdentity';E={$_.IdentityProfile.kubeletidentity.ObjectId}} |
+  Export-Csv -Path "aks_identities_$subscriptionId.csv" -NoTypeInformation
+```
+
+### 6.4 Step-by-Step Subscription Transfer Process
+
+#### Step 1 — Prepare the Source Subscription
+
+1. **Remove resource locks** that would prevent the transfer:
+   ```bash
+   # List all locks
+   az lock list --subscription {subscription-id} --output table
+   # Remove if blocking transfer (document them for recreation)
+   az lock delete --name {lock-name} --resource-group {rg}
+   ```
+
+2. **Cancel or migrate Azure Marketplace resources** that don't support transfer. Check the [Microsoft documentation](https://learn.microsoft.com/en-us/azure/cost-management-billing/manage/transfer-subscriptions-subscribers-csp#azure-marketplace-products-transfer) for unsupported products.
+
+3. **Validate there are no expired or disabled resources** that could block the transfer.
+
+#### Step 2 — Initiate the Transfer from the Azure Portal
+
+1. Sign in to the [Azure portal](https://portal.azure.com) as a **Subscription Owner** or **Global Administrator** on the contoso.com tenant.
+2. Navigate to **Subscriptions** → select the subscription → **Change directory**.
+3. Select **zava.com** as the target directory.
+4. Review the summary of impact (resources that will be affected).
+5. Check **"I understand the impact..."** and click **Change**.
+
+> ⚠️ The transfer takes **15–30 minutes** to propagate. During this time the subscription and its resources may be temporarily unavailable.
+
+Alternatively, use Azure CLI:
+
+```bash
+# Transfer subscription to new tenant
+az account tenant update \
+  --tenant-id {zava-com-tenant-id} \
+  --subscription {subscription-id}
+```
+
+Or via REST API:
+
+```bash
+# POST https://management.azure.com/subscriptions/{subscription-id}/providers/Microsoft.Subscription/changeDirectory
+curl -X POST \
+  "https://management.azure.com/subscriptions/{subscription-id}/providers/Microsoft.Subscription/changeDirectory?api-version=2021-01-01" \
+  -H "Authorization: Bearer {access-token}" \
+  -H "Content-Type: application/json" \
+  -d '{"directionId": "{zava-com-tenant-id}"}'
+```
+
+#### Step 3 — Accept the Subscription in the Target Tenant
+
+1. Sign in to the Azure portal as a **Global Administrator** in the zava.com tenant.
+2. Navigate to **Subscriptions** — the transferred subscription should appear (may take a few minutes).
+3. Verify the subscription is visible and **Enabled**.
+
+#### Step 4 — Restore RBAC Role Assignments
+
+All RBAC was deleted during transfer. Restore from the exported data:
+
+```powershell
+# Import the exported role assignments and recreate them
+$assignments = Import-Csv -Path "rbac_assignments_{subscription-id}.csv"
+
+foreach ($assignment in $assignments) {
+    # Map old identities to new zava.com identities
+    $newObjectId = Get-NewObjectId -OldObjectId $assignment.ObjectId  # Use your mapping table
+
+    if ($newObjectId) {
+        New-AzRoleAssignment `
+          -ObjectId $newObjectId `
+          -RoleDefinitionName $assignment.RoleDefinitionName `
+          -Scope $assignment.Scope `
+          -ErrorAction SilentlyContinue
+    } else {
+        Write-Warning "No mapping found for $($assignment.DisplayName) ($($assignment.ObjectId))"
+    }
+}
+```
+
+For custom role definitions:
+
+```powershell
+# Recreate custom roles in the new tenant context
+$customRoles = Get-Content "custom_roles_{subscription-id}.json" | ConvertFrom-Json
+foreach ($role in $customRoles) {
+    $role.AssignableScopes = @("/subscriptions/{subscription-id}")
+    $role.Id = $null  # Let Azure generate a new ID
+    New-AzRoleDefinition -Role $role
+}
+```
+
+#### Step 5 — Restore Managed Identities
+
+**System-assigned managed identities:**
+
+```powershell
+# Re-enable system-assigned identity on each affected resource
+# Example: App Service
+Set-AzWebApp -ResourceGroupName {rg} -Name {app-name} -AssignIdentity $true
+
+# Example: Virtual Machine
+Update-AzVM -ResourceGroupName {rg} -VM (Get-AzVM -ResourceGroupName {rg} -Name {vm-name}) -IdentityType SystemAssigned
+
+# Example: Azure Function
+Update-AzFunctionApp -ResourceGroupName {rg} -Name {func-name} -IdentityType SystemAssigned
+```
+
+> ⚠️ **Important**: After re-enabling, the managed identity will have a **new Principal ID**. Any RBAC assignments, Key Vault policies, or app configuration referencing the old ID must be updated with the new one.
+
+**User-assigned managed identities:**
+
+```powershell
+# Recreate user-assigned managed identities
+$identities = Import-Csv "user_assigned_mi_{subscription-id}.csv"
+foreach ($mi in $identities) {
+    New-AzUserAssignedIdentity `
+      -ResourceGroupName $mi.ResourceGroupName `
+      -Name $mi.Name `
+      -Location $mi.Location
+}
+
+# Reassign to resources that need them (example: VM)
+$identity = Get-AzUserAssignedIdentity -ResourceGroupName {rg} -Name {mi-name}
+Update-AzVM -ResourceGroupName {rg} -VM (Get-AzVM -ResourceGroupName {rg} -Name {vm-name}) `
+  -IdentityType UserAssigned -IdentityId $identity.Id
+```
+
+#### Step 6 — Restore Key Vault Access
+
+**If using access policies:**
+
+```powershell
+# Update Key Vault access policies with new object IDs from zava.com
+$vaultName = "{vault-name}"
+$policies = Import-Csv "keyvault_access_$vaultName.csv"
+
+foreach ($policy in $policies) {
+    $newObjectId = Get-NewObjectId -OldObjectId $policy.ObjectId
+    if ($newObjectId) {
+        Set-AzKeyVaultAccessPolicy -VaultName $vaultName `
+          -ObjectId $newObjectId `
+          -PermissionsToSecrets Get,List `
+          -PermissionsToKeys Get,List,WrapKey,UnwrapKey `
+          -PermissionsToCertificates Get,List
+    }
+}
+```
+
+**If using Key Vault RBAC (recommended):**
+
+```powershell
+# Recreate RBAC for Key Vault data plane
+New-AzRoleAssignment `
+  -ObjectId {new-sp-or-mi-object-id} `
+  -RoleDefinitionName "Key Vault Secrets User" `
+  -Scope "/subscriptions/{subscription-id}/resourceGroups/{rg}/providers/Microsoft.KeyVault/vaults/{vault-name}"
+```
+
+#### Step 7 — Reconfigure Azure SQL and Cosmos DB
+
+```powershell
+# Set new Entra ID admin on Azure SQL Server
+Set-AzSqlServerActiveDirectoryAdministrator `
+  -ServerName {server-name} `
+  -ResourceGroupName {rg} `
+  -DisplayName "{admin-display-name}" `
+  -ObjectId {new-admin-object-id}
+
+# For Cosmos DB — recreate RBAC assignments
+New-AzCosmosDBSqlRoleAssignment `
+  -AccountName {cosmos-account} `
+  -ResourceGroupName {rg} `
+  -RoleDefinitionId {role-def-id} `
+  -Scope "/" `
+  -PrincipalId {new-object-id}
+```
+
+#### Step 8 — Reconfigure AKS Clusters
+
+AKS requires special attention due to multiple identity components:
+
+```bash
+# Update the cluster identity to a new system-assigned identity
+az aks update \
+  --resource-group {rg} \
+  --name {aks-cluster} \
+  --enable-managed-identity
+
+# Rotate cluster credentials (forces re-authentication)
+az aks get-credentials --resource-group {rg} --name {aks-cluster} --overwrite-existing
+
+# If using pod identity / workload identity:
+# Recreate federated identity credentials for each service account
+az identity federated-credential create \
+  --name {federated-id-name} \
+  --identity-name {managed-identity-name} \
+  --resource-group {rg} \
+  --issuer {aks-oidc-issuer-url} \
+  --subject system:serviceaccount:{namespace}:{service-account} \
+  --audience api://AzureADTokenExchange
+```
+
+> ⚠️ **AKS cluster reconfiguration may cause brief workload disruption**. Plan a maintenance window for critical AKS-hosted services.
+
+#### Step 9 — Reconfigure App Services and Function Apps
+
+```powershell
+# Re-enable identity and update Key Vault references
+$app = Get-AzWebApp -ResourceGroupName {rg} -Name {app-name}
+$newPrincipalId = $app.Identity.PrincipalId
+
+# Grant new identity access to Key Vault
+Set-AzKeyVaultAccessPolicy -VaultName {vault-name} `
+  -ObjectId $newPrincipalId `
+  -PermissionsToSecrets Get,List
+
+# Update Key Vault reference app settings (if using @Microsoft.KeyVault syntax)
+# These auto-resolve once the identity has access — verify they resolve correctly
+az webapp config appsettings list --name {app-name} --resource-group {rg} --output table
+```
+
+#### Step 10 — Restore Azure Container Registry Access
+
+```bash
+# Grant AcrPull to AKS kubelet identity
+az role assignment create \
+  --assignee {new-kubelet-identity-object-id} \
+  --role AcrPull \
+  --scope /subscriptions/{subscription-id}/resourceGroups/{rg}/providers/Microsoft.ContainerRegistry/registries/{acr-name}
+
+# Grant AcrPush to CI/CD service principal
+az role assignment create \
+  --assignee {new-sp-object-id} \
+  --role AcrPush \
+  --scope /subscriptions/{subscription-id}/resourceGroups/{rg}/providers/Microsoft.ContainerRegistry/registries/{acr-name}
+```
+
+#### Step 11 — Restore Resource Locks
+
+Recreate any resource locks removed in Step 1:
+
+```bash
+az lock create --name {lock-name} --resource-group {rg} --lock-type CanNotDelete --notes "Restored after tenant migration"
+```
+
+### 6.5 Subscription Transfer Validation Checklist
+
+After each subscription transfer, validate every component before proceeding:
+
+| # | Validation | Command / Method | Pass/Fail |
+|---|---|---|---|
+| 1 | Subscription visible in zava.com tenant | Azure portal → Subscriptions | ☐ |
+| 2 | Subscription state is "Enabled" | `az account show --subscription {id}` | ☐ |
+| 3 | All RBAC role assignments recreated | `az role assignment list --subscription {id} --output table` | ☐ |
+| 4 | Custom role definitions recreated | `az role definition list --custom-role-only --subscription {id}` | ☐ |
+| 5 | System-assigned managed identities re-enabled | Check each resource in portal or via CLI | ☐ |
+| 6 | User-assigned managed identities recreated and assigned | `az identity list --subscription {id}` | ☐ |
+| 7 | Key Vault access restored (policies or RBAC) | `az keyvault show --name {vault}` + test secret retrieval | ☐ |
+| 8 | Azure SQL Entra ID admin set correctly | `az sql server ad-admin list --server {name} --resource-group {rg}` | ☐ |
+| 9 | AKS cluster operational and pods running | `kubectl get nodes` + `kubectl get pods --all-namespaces` | ☐ |
+| 10 | ACR accessible from AKS and CI/CD | `az acr login --name {acr}` + `docker pull {acr}.azurecr.io/{image}` | ☐ |
+| 11 | App Services healthy with resolved Key Vault refs | `az webapp config appsettings list` + app health endpoint | ☐ |
+| 12 | Azure Monitor alerts functional | `az monitor alert list --subscription {id}` | ☐ |
+| 13 | Resource locks restored | `az lock list --subscription {id}` | ☐ |
+| 14 | Azure DevOps billing subscription functional | Azure DevOps → Organization Settings → Billing | ☐ |
+
+### 6.6 Transfer Sequencing for Multiple Subscriptions
+
+If multiple subscriptions are being transferred:
+
+1. **Start with non-production subscriptions** (dev, test, staging) to validate the process and scripts.
+2. **Transfer production subscriptions** only after non-production is validated.
+3. **Transfer the Azure DevOps billing subscription last** (or verify billing remains functional throughout).
+4. Allow **24 hours** between transfers to resolve unexpected issues.
+
+```
+Transfer Sequence:
+  Dev subscription      ──→ Validate ──→ ✅
+  Test subscription     ──→ Validate ──→ ✅
+  Staging subscription  ──→ Validate ──→ ✅
+  Production subscription ──→ Validate ──→ ✅
+  Billing subscription  ──→ Validate ──→ ✅
+  ────────────────────────────────────────────
+  Azure DevOps directory switch ──→ Phase 3
+```
+
+### 6.7 Subscriptions Not Being Transferred (Alternative Path)
+
+If some or all subscriptions remain under contoso.com while Azure DevOps moves to zava.com:
+
+#### Option A — Multi-Tenant App Registration
+
+1. Create app registrations in zava.com with `SignInAudience` set to `AzureADMultipleOrgs`.
+2. Grant the service principal Contributor (or appropriate) role on the contoso.com subscription.
+3. Configure the Azure DevOps service connection to authenticate against the contoso.com tenant using the multi-tenant app.
+
+```powershell
+# Create multi-tenant app registration
+$app = New-MgApplication -DisplayName "AzDevOps-CrossTenant-{name}" `
+  -SignInAudience "AzureADMultipleOrgs"
+
+# In contoso.com: create a service principal for the multi-tenant app
+# (Admin consent required in contoso.com)
+New-MgServicePrincipal -AppId $app.AppId
+```
+
+#### Option B — Azure Lighthouse
+
+Use [Azure Lighthouse](https://learn.microsoft.com/en-us/azure/lighthouse/overview) to delegate access from contoso.com subscriptions to zava.com identities:
+
+1. Create a Lighthouse delegation template granting specific roles to zava.com service principals.
+2. Deploy the delegation in the contoso.com subscription.
+3. Configure Azure DevOps service connections to use the delegated access.
+
+> ⚠️ **Trade-off**: Keeping subscriptions in contoso.com avoids the transfer blast radius but introduces permanent cross-tenant management complexity and requires maintaining admin access to contoso.com indefinitely.
 
 ---
 
@@ -345,7 +722,7 @@ If subscriptions remain under contoso.com while Azure DevOps moves to zava.com:
 | Self-hosted agents unable to authenticate | High | Medium | Pre-document agent registrations; prepare re-registration scripts and new PATs |
 | Service hooks and webhooks stop firing | Medium | Medium | Inventory all service hooks; update authentication after migration |
 | Organization billing disrupted | Low | High | Verify billing subscription is accessible from zava.com; update billing owner |
-| Audit trail discontinuity | Low | Medium | Export audit logs before migration; document the identity mapping for traceability |
+| Audit trail discontinuity | Low | Medium | Export audit logs before migration; document the identity mapping for traceability |\n| Azure subscription transfer breaks production services | Medium | Critical | Transfer non-prod first; validate each subscription fully before proceeding; maintain rollback window |
 
 ---
 
@@ -557,7 +934,19 @@ $secret = Add-MgApplicationPassword -ApplicationId $app.Id `
   -PasswordCredential @{ DisplayName = "AzDevOps"; EndDateTime = (Get-Date).AddYears(1) }
 ```
 
-#### 2.3 Update Azure RBAC Assignments
+#### 2.3 Transfer Azure Subscriptions to zava.com
+
+Follow the complete process in [Section 6 — Azure Subscription Transfer Process](#6-azure-subscription-transfer-process):
+
+1. Export all RBAC assignments, managed identities, Key Vault access policies, and SQL admins (Section 6.3).
+2. Initiate the subscription transfer via the Azure portal (Section 6.4, Steps 1–3).
+3. Restore RBAC, managed identities, Key Vault, SQL, AKS, App Services, and ACR (Section 6.4, Steps 4–11).
+4. Validate the transfer using the checklist (Section 6.5).
+5. For multiple subscriptions, follow the sequencing guidance (Section 6.6).
+
+> ⚠️ Complete subscription transfers and validation **before** proceeding to the Azure DevOps directory switch.
+
+#### 2.4 Update Azure RBAC Assignments
 
 If Azure resources (subscriptions, resource groups) are also moving to the zava.com tenant, update RBAC role assignments:
 
@@ -569,7 +958,7 @@ az role assignment create \
   --scope "/subscriptions/{subscription-id}"
 ```
 
-#### 2.4 Back Up Azure DevOps Configurations
+#### 2.5 Back Up Azure DevOps Configurations
 
 - Export team and area/iteration configurations.
 - Export security/permission settings using the Azure DevOps REST API.
@@ -579,7 +968,7 @@ az role assignment create \
 - Export organization policies (**Organization Settings → Policies**): third-party app access, SSH authentication, public projects, etc.
 - Document **billing configuration** — the Azure subscription used for billing must be accessible from the new tenant.
 
-#### 2.5 Prepare Self-Hosted Agent Re-registration
+#### 2.6 Prepare Self-Hosted Agent Re-registration
 
 Prepare for rapid re-registration of all self-hosted agents after the directory switch:
 
@@ -734,9 +1123,14 @@ gantt
     04 Create App Registrations & SPs           :prep04, after prep02, 2d
     Configure Workload Identity Federation      :prep04b, after prep04, 1d
     05 Assign RBAC Roles                        :prep05, after prep04b, 1d
-    Transfer Subscriptions (if applicable)      :prep05b, after prep05, 2d
-    Recreate Managed Identities                 :prep05c, after prep05b, 1d
-    06 Backup AzDO Settings & Org Policies      :prep06, after prep05c, 1d
+    Export subscription RBAC & identities       :sub01, after prep05, 1d
+    Transfer Dev/Test subscriptions             :sub02, after sub01, 2d
+    Restore RBAC & identities (Dev/Test)        :sub03, after sub02, 2d
+    Validate Dev/Test subscriptions             :sub04, after sub03, 1d
+    Transfer Prod subscription                  :crit, sub05, after sub04, 1d
+    Restore RBAC & identities (Prod)            :crit, sub06, after sub05, 2d
+    Validate Prod subscription                  :crit, sub07, after sub06, 1d
+    06 Backup AzDO Settings & Org Policies      :prep06, after sub07, 1d
     Prepare Agent Re-registration Scripts       :prep07, after prep06, 1d
     Gate 2 — Preparation Go/No-Go              :milestone, gate2, after prep07, 0d
 
@@ -791,7 +1185,7 @@ gantt
 | 15 | ☐ | Inventory all variable groups, noting Key Vault-linked groups and secret values. | — |
 | 16 | ☐ | Inventory all managed identities (system/user-assigned) used by pipelines. | — |
 | 17 | ☐ | Export Azure DevOps audit logs for compliance record. | — |
-| 18 | ☐ | Document current organization billing subscription and owner. | — |
+| 18 | ☐ | Document current organization billing subscription and owner. | — |\n| 18a | ☐ | Inventory all Azure subscriptions linked to service connections — decide transfer vs. cross-tenant ([Section 2](#key-decision--azure-subscription-transfer)). | — |\n| 18b | ☐ | Export RBAC assignments for each subscription to be transferred ([Section 6.3](#63-pre-transfer-inventory-and-export)). | — |\n| 18c | ☐ | Export Key Vault access policies, SQL Entra admins, and AKS identities for each subscription ([Section 6.3](#63-pre-transfer-inventory-and-export)). | — |\n| 18d | ☐ | Document resource locks and Marketplace resources that may block transfer. | — |
 | 19 | ☐ | Create a communication plan and notify all stakeholders. | — |
 | 20 | ☐ | Schedule the migration window (off-hours recommended). | — |
 | 21 | ☐ | Document the rollback plan and assign rollback decision owner. | — |
@@ -814,9 +1208,16 @@ gantt
 | 25 | ☐ | Set up MFA policies in zava.com. | — |
 | 26 | ☐ | Back up all Azure DevOps organization settings and permissions. | [06-Backup-AzDOSettings.ps1](scripts/preparation/06-Backup-AzDOSettings.ps1) |
 | 27 | ☐ | Back up organization policy settings (OAuth, SSH, guest access, etc.). | — |
-| 28 | ☐ | Transfer Azure subscriptions to zava.com (if applicable). | — |
-| 29 | ☐ | Recreate RBAC assignments on transferred subscriptions. | — |
-| 30 | ☐ | Recreate/re-enable managed identities on transferred subscriptions. | — |
+| 28 | ☐ | Transfer Azure subscriptions to zava.com — follow full process in [Section 6](#6-azure-subscription-transfer-process). | — |
+| 29 | ☐ | Restore RBAC assignments on transferred subscriptions (Step 4 of [Section 6.4](#64-step-by-step-subscription-transfer-process)). | — |
+| 30 | ☐ | Recreate/re-enable managed identities on transferred subscriptions (Step 5 of [Section 6.4](#64-step-by-step-subscription-transfer-process)). | — |
+| 30a | ☐ | Restore Key Vault access policies/RBAC (Step 6 of [Section 6.4](#64-step-by-step-subscription-transfer-process)). | — |
+| 30b | ☐ | Reconfigure Azure SQL / Cosmos DB Entra ID admins (Step 7 of [Section 6.4](#64-step-by-step-subscription-transfer-process)). | — |
+| 30c | ☐ | Reconfigure AKS cluster identities (Step 8 of [Section 6.4](#64-step-by-step-subscription-transfer-process)). | — |
+| 30d | ☐ | Reconfigure App Services / Function Apps identity (Step 9 of [Section 6.4](#64-step-by-step-subscription-transfer-process)). | — |
+| 30e | ☐ | Restore ACR access (Step 10 of [Section 6.4](#64-step-by-step-subscription-transfer-process)). | — |
+| 30f | ☐ | Restore resource locks (Step 11 of [Section 6.4](#64-step-by-step-subscription-transfer-process)). | — |
+| 30g | ☐ | **Validate subscription transfer** — complete checklist in [Section 6.5](#65-subscription-transfer-validation-checklist). | — |
 | 31 | ☐ | Prepare self-hosted agent re-registration scripts. | — |
 | 32 | ☐ | Test user sign-in to zava.com tenant (outside of Azure DevOps). | — |
 | 33 | ☐ | Send final migration notification to all users (24h before). | — |
@@ -1007,8 +1408,13 @@ After the directory switch, verify that **Organization Policies** are still conf
 
 - [Azure RBAC documentation](https://learn.microsoft.com/en-us/azure/role-based-access-control/overview) — Role-based access control for Azure resources.
 - [Azure CLI documentation](https://learn.microsoft.com/en-us/cli/azure/) — Azure command-line interface.
-- [Transfer Azure subscriptions between tenants](https://learn.microsoft.com/en-us/azure/role-based-access-control/transfer-subscription) — Transferring subscriptions to a new tenant.
+- [Transfer Azure subscriptions between tenants](https://learn.microsoft.com/en-us/azure/role-based-access-control/transfer-subscription) — **Primary guide** for transferring subscriptions to a new tenant.
+- [Associate or add an Azure subscription to your Microsoft Entra tenant](https://learn.microsoft.com/en-us/entra/fundamentals/how-subscriptions-associated-directory) — How subscriptions relate to Entra ID tenants.
+- [Azure Lighthouse overview](https://learn.microsoft.com/en-us/azure/lighthouse/overview) — Cross-tenant resource management (alternative to subscription transfer).
 - [Azure Key Vault — Move to a different tenant](https://learn.microsoft.com/en-us/azure/key-vault/general/move-subscription) — Key Vault tenant migration.
+- [Managed identities for Azure resources](https://learn.microsoft.com/en-us/entra/identity/managed-identities-azure-resources/overview) — How managed identities work and their tenant dependency.
+- [AKS — Update cluster credentials](https://learn.microsoft.com/en-us/azure/aks/update-credentials) — Updating AKS cluster identity after tenant change.
+- [Workload Identity Federation for Azure DevOps](https://learn.microsoft.com/en-us/azure/devops/pipelines/library/connect-to-azure?view=azure-devops#create-an-azure-resource-manager-service-connection-that-uses-workload-identity-federation) — OIDC-based service connections (recommended).
 
 ### GitHub Copilot
 
@@ -1017,6 +1423,6 @@ After the directory switch, verify that **Organization Policies** are still conf
 
 ---
 
-*Document version: 2.0*
+*Document version: 3.0*
 *Last updated: 2026-03-13*
 *Author: Migration Team*
